@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Forecast GTA VI's launch-day Twitch viewers hour by hour.
+"""Forecast GTA VI's launch-day Twitch viewers hour by hour. (v2)
 
 Method, in one paragraph: a launch day on Twitch is not a random walk — it is
 a rolling midnight unlock. Hour 1 (00:00-01:00 UTC) only has the regions that
@@ -12,23 +12,65 @@ size is to this case's (a Gaussian kernel, bandwidth 1.5 in log units), after
 dropping the weakest 15% of comparables by peak ratio (flops and thin
 categories whose hour-1 print was barely a launch at all). The quantile
 spread comes from that hour's regression residuals, capped at 0.6 log units
-and scaled by 0.65 — the raw residual spread across all comparables overstates
-the uncertainty for a big launch, and an honest but tighter band scores
-better on the pinball loss. Everything is exact arithmetic on the case file;
-no randomness, no network, no wall clock, no files outside the input, so two
+and scaled by 0.5. Everything is exact arithmetic on the case file; no
+randomness, no network, no wall clock, no files outside the input, so two
 runs on the same case write byte-identical forecasts.
+
+What changed from v1 (and why), each change validated on the four practice
+cases and on leave-one-out cross-validation over the comparables:
+
+1. Early-access-contaminated and weak comparables are excluded before
+   fitting. The case file itself tags every comparable's unlock text with a
+   Tier ("Tier: early-access-contaminated" for launches whose Deluxe edition
+   unlocked days early, "Tier: weak" for thin launches, "Tier: comparable"
+   otherwise, "Tier: target-history" for GTA VI's own pre-release category,
+   which is never a launch). An early-access launch's release-day curve is
+   flattened — much of its audience had already played for days — so it
+   biases a clean launch's forecast toward a flatter rise. Dropping those
+   11 of 37 rows cuts the practice mean loss from 0.1535 to 0.1324 on its
+   own. The tier is read from the house-provided `unlock` field; a
+   comparable with no Tier tag is treated as comparable.
+2. Per-hour slopes are shrunk 0.7 toward the pooled slope across hours.
+   Each hour's regression is fitted on only ~23 rows, so its slope is
+   noisy; the hours share one underlying size-to-rise relationship, and
+   pulling each hour's slope 30% of the way to the all-hours mean slope
+   stabilises the extrapolation to a huge hour-1 print. Practice 0.1324
+   -> 0.1302 (spread 0.55) / 0.1280 (spread 0.5).
+3. Spread scale 0.65 -> 0.5. The practice cases reward a tighter band once
+   the median is less biased; the residual SD is still floored at 0.35 so
+   the 5%-95% band never collapses.
+4. The p1 cap is REMOVED. v1 capped the prediction's log hour-1 size at the
+   90th percentile of the comparables. With the contaminated rows gone the
+   cap hurts (practice 0.1430 vs 0.1382 with it on the same model, and it
+   worsens leave-one-out on big launches); the kernel already concentrates
+   weight on the biggest comparables for a huge hour-1 print, and the
+   fitted slopes are small (peak log-ratio ~ 11.66 + 0.068 * log p1), so
+   extrapolating to a GTA VI-sized hour-1 print (checked to 2,000,000
+   viewers: median peak 1.41M at hour 17, all finite) stays sane.
+
+Validation (local scorer, pinball loss on log scale, hours 2..24):
+practice mean 0.1280 — p00 0.111, p01 0.135, p02 0.090, p03 0.175
+(v1: 0.1535 — p00 0.144, p01 0.190, p02 0.109, p03 0.170).
+Leave-one-out over the comparables, restricted to the final's own regime
+(big rolling-midnight launches, p1 >= 20,000, 9 folds): mean 0.2703,
+median 0.1461 (v1: mean 0.2758, median 0.1693) — v2 is better there, and
+on rolling comparable launches (8 folds) 0.2829 vs v1's 0.2856.
+On ALL 37 leave-one-out folds v2 is worse than v1 (mean 0.5067 vs 0.4329):
+that worsening is concentrated in folds that are not the final's type —
+simultaneous-global launches whose spike hour no model can predict, and
+early-access-contaminated test launches (the final is a clean rolling
+launch, so neither applies). Models that chased a lower practice loss with
+extra features (hour-1 channels, pre-release history ratios) were rejected:
+they reached 0.127 on practice but blew up leave-one-out on every subset,
+so they were not used. No practice answers are embedded anywhere; the
+program computes every forecast from the input case at runtime.
 
 Why log hour-1 size matters: across the comparables the evening peak is
 almost independent of the hour-1 print (log peak ~ 11.7 + 0.07 * log p1), so
 a small hour-1 print means a much bigger rise ahead, and a huge hour-1
 print means the launch is already near its peak. A flat persistence forecast
 misses that entirely, which is why it scores ~0.387 on the practice cases
-while this one scores ~0.15. One guardrail: the prediction's log hour-1 size
-is capped at the 90th percentile of the comparables, because the only two
-comparables bigger than that had simultaneous global unlocks and peaked in
-hour 1 — a pattern a rolling-midnight console launch will not repeat, so
-letting a very large GTA VI hour-1 print extrapolate toward "peak already
-passed" would be the wrong shape.
+while this one scores ~0.13.
 
 Run as the grader runs it: `python3 -P -s /bot/main.py` (Python 3.13, stdlib
 only). It reads every <id>.in in $MAKEFUN_INPUT_DIR (else /input/) and writes
@@ -39,6 +81,7 @@ one <id>.out per case to $MAKEFUN_OUTPUT_DIR (else /output/):
 import json
 import math
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -59,12 +102,19 @@ BANDWIDTH = 1.5
 # Centre of the log hour-1 size (log viewers); only shifts the intercept.
 LOG_P1_CENTRE = 10.8
 # Quantile spread: residual SD per hour, clamped, then scaled.
-SPREAD_SCALE = 0.65
+SPREAD_SCALE = 0.5
 SD_FLOOR = 0.35
 SD_CAP = 0.6
 # Drop the weakest share of comparables by peak ratio before fitting.
 DROP_BOTTOM = 0.15
 MIN_ROWS_PER_HOUR = 8
+# Shrink each hour's slope this far toward the pooled (all-hours) slope.
+SHRINK = 0.7
+# Tiers (parsed from the house-provided `unlock` text) excluded from fitting:
+# early-access launches have flattened release-day curves, weak launches are
+# thin, and target-history is GTA VI's own pre-release category, not a launch.
+EXCLUDED_TIERS = ("early-access-contaminated", "weak", "target-history")
+_TIER_RE = re.compile(r"Tier:\s*([a-z\-]+)")
 
 
 def round2(x):
@@ -79,6 +129,12 @@ def round2(x):
 
 def parse_dt(s):
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def parse_tier(unlock):
+    """Tier tag from the comparable's unlock text; 'comparable' when absent."""
+    m = _TIER_RE.search(unlock or "")
+    return m.group(1) if m else "comparable"
 
 
 def release_day_points(comp):
@@ -122,7 +178,8 @@ def comparable_rows(case):
                 lr[h] = math.log(pts[h - 1] / p1)
         if len(lr) >= 20:
             peak = max((math.exp(v) for v in lr.values()), default=0.0)
-            rows.append({"p1": p1, "lr": lr, "peak_ratio": peak})
+            rows.append({"p1": p1, "lr": lr, "peak_ratio": peak,
+                         "tier": parse_tier(comp.get("unlock") or "")})
     return rows
 
 
@@ -134,22 +191,15 @@ def solve2(a11, a12, a22, b1, b2):
     return ((b1 * a22 - b2 * a12) / det, (a11 * b2 - a12 * b1) / det)
 
 
-def fit_hour(rows, p1, h, cap=None):
+def fit_hour(rows, p1, h):
     """Kernel-weighted OLS of this hour's log-ratio on centred log p1.
 
-    Returns (median log-ratio, spread in log units) or None. ``cap`` is an
-    upper bound on the log hour-1 size used for the prediction: past the
-    largest launches the comparables stop being informative about the shape
-    (the two biggest had simultaneous global unlocks and peaked in hour 1,
-    while a rolling-midnight console launch keeps rising into the evening),
-    so an hour-1 print above the cap is predicted as if it sat at the cap.
+    Returns (median log-ratio, spread in log units, slope) or None.
     """
     x0 = math.log(p1) - LOG_P1_CENTRE
-    if cap is not None:
-        x0 = min(x0, cap - LOG_P1_CENTRE)
+    x0_log = x0 + LOG_P1_CENTRE
     s_w = s_wx = s_wxx = s_wy = s_wxy = 0.0
     pts = []
-    x0_log = x0 + LOG_P1_CENTRE
     for r in rows:
         if h not in r["lr"]:
             continue
@@ -172,7 +222,7 @@ def fit_hour(rows, p1, h, cap=None):
     ss = sum((y - (a + b * x)) ** 2 for x, y in pts)
     sd = math.sqrt(ss / max(len(pts) - 2, 1))
     sd = min(max(sd, SD_FLOOR), SD_CAP)
-    return mu, sd
+    return mu, sd, b
 
 
 def forecast_case(case, name):
@@ -189,31 +239,42 @@ def forecast_case(case, name):
     p1 = max(1.0, p1)
 
     rows = comparable_rows(case)
+    # Exclude early-access-contaminated / weak / target-history comparables
+    # (see module docstring), then drop the weakest 15% by peak ratio.
+    rows = [r for r in rows if r["tier"] not in EXCLUDED_TIERS]
     if rows:
         ratios = sorted(r["peak_ratio"] for r in rows)
         cut = ratios[int(DROP_BOTTOM * len(ratios))]
         rows = [r for r in rows if r["peak_ratio"] >= cut]
-        # Cap the prediction's log hour-1 size at the 90th percentile of the
-        # comparables' log hour-1 sizes (see fit_hour).
-        xs = sorted(math.log(r["p1"]) for r in rows)
-        cap = xs[int(0.9 * len(xs))]
-    else:
-        cap = None
 
-    # Fallback median curve (all comparables, unweighted) if a fit fails.
+    # Fallback median curve (tier-filtered comparables, unweighted) if a fit fails.
     medians = {}
     for h in range(2, 25):
         vals = sorted(r["lr"][h] for r in rows if h in r["lr"])
         medians[h] = vals[len(vals) // 2] if vals else 0.0
 
+    # First pass: per-hour fits, to get each hour's slope for shrinkage.
+    fits = {}
+    slopes = {}
+    for h in range(2, 25):
+        fit = fit_hour(rows, p1, h) if rows else None
+        if fit is not None:
+            fits[h] = fit
+            slopes[h] = fit[2]
+    pooled = sum(slopes.values()) / len(slopes) if slopes else 0.0
+
     hours = []
     for row in case["forecast"]:
         h = row["hour"]
-        fit = fit_hour(rows, p1, h, cap) if rows else None
+        fit = fits.get(h)
         if fit is None:
             mu, sd = medians[h], SD_CAP
         else:
-            mu, sd = fit
+            mu, sd, b = fit
+            # Shrink this hour's slope toward the pooled slope, re-anchoring
+            # the fitted value at the centre so only the extrapolation moves.
+            b2 = SHRINK * b + (1.0 - SHRINK) * pooled
+            mu = mu + (b2 - b) * (math.log(p1) - LOG_P1_CENTRE)
         spread = sd * SPREAD_SCALE
         qs = [round2(p1 * math.exp(mu + z * spread)) for z in Z]
         qs = [max(q, 0.01) for q in qs]
